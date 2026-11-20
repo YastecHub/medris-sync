@@ -1,0 +1,91 @@
+name: Sync Medris from Kennis
+
+# Every 5 minutes (the shortest GitHub allows; when GitHub is busy a run can start a few minutes late): if
+# kenniskalu18-prog/Medris main has new commits, YastecHub/Medris main is moved forward to the same commit. Heroku and
+# Cloudflare deploy YastecHub/Medris main, so whatever is merged into Kennis's main goes live on its own, usually within
+# 5-10 minutes, with nobody pressing "Sync fork".
+#
+# It only ever fast-forwards. If YastecHub/Medris main has commits that Kennis's main does not, it changes nothing and
+# the run fails (GitHub e-mails you). Fix: open those commits as a pull request to Kennis's repository, or on GitHub
+# press Sync fork > Discard commits on YastecHub/Medris.
+#
+# Needs one secret in THIS repository: SYNC_TOKEN, a fine-grained personal access token with
+#   Repository access: Only select repositories > YastecHub/Medris
+#   Permissions: Contents = Read and write, Workflows = Read and write
+# (GitHub refuses to bring in changes to .github/workflows files without the Workflows permission.)
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # only for the keep-alive commit to this repository, below
+
+concurrency:
+  group: sync
+  cancel-in-progress: false
+
+env:
+  FORK: YastecHub/Medris
+  UPSTREAM_OWNER: kenniskalu18-prog
+  BRANCH: main
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Move YastecHub/Medris main forward to Kennis's main
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::The SYNC_TOKEN secret is missing: Settings > Secrets and variables > Actions (see the top of sync.yml)."
+            exit 1
+          fi
+          # base = the fork's main, head = Kennis's main
+          compared=$(gh api "repos/$FORK/compare/$BRANCH...$UPSTREAM_OWNER:$BRANCH" --jq '"\(.status) \(.ahead_by) \(.behind_by)"')
+          read -r status ahead behind <<< "$compared"
+          case "$status" in
+            identical)
+              echo "Already the same as Kennis's main."
+              ;;
+            ahead)
+              result=$(gh api -X POST "repos/$FORK/merge-upstream" -f branch="$BRANCH" --jq '"\(.merge_type): \(.message)"')
+              echo "$result"
+              case "$result" in
+                fast-forward:*) ;;
+                *) echo "::error::Expected a fast-forward, got: $result"; exit 1 ;;
+              esac
+              echo "Brought in $ahead new commit(s) from Kennis's main. Heroku and Cloudflare deploy them now." | tee -a "$GITHUB_STEP_SUMMARY"
+              ;;
+            behind)
+              echo "::warning::$FORK main has $behind commit(s) that Kennis's main does not. Nothing to bring in; open them as a pull request to Kennis's repository."
+              ;;
+            *)
+              echo "::error::$FORK main and Kennis's main have both moved ($behind commit(s) only on yours, $ahead only on Kennis's), so it cannot just move forward. Open yours as a pull request to Kennis's repository, or press Sync fork > Discard commits on GitHub."
+              exit 1
+              ;;
+          esac
+
+      # GitHub switches off scheduled workflows in a public repository after 60 days without a commit, and nothing else
+      # is ever committed here. An empty commit every 45 days keeps this schedule running.
+      - name: Is a keep-alive commit due?
+        id: age
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          last=$(gh api "repos/$GITHUB_REPOSITORY/commits?per_page=1" --jq '.[0].commit.committer.date')
+          days=$(( ( $(date +%s) - $(date -d "$last" +%s) ) / 86400 ))
+          echo "Last commit here: $days day(s) ago."
+          echo "due=$([ "$days" -ge 45 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.age.outputs.due == 'true'
+      - name: Keep-alive commit
+        if: steps.age.outputs.due == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "Keep the sync schedule running"
+          git push
